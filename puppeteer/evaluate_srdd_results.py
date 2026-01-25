@@ -262,14 +262,14 @@ def evaluate_single_sample(pred: Dict, task_description: str = "") -> SRDDMetric
             code_path = ""
             code = pred
     else:
-        return SRDDMetrics(0, 0, 0, -1.0, "Invalid prediction format")
+        return SRDDMetrics(0, 0, 0, 0.0, "Invalid prediction format")
 
     # Get code content
     if code_path and os.path.exists(code_path):
         code = read_code(code_path)
     
     if not code or len(code.strip()) == 0:
-        return SRDDMetrics(0, 0, 0, -1.0, "No code found")
+        return SRDDMetrics(0, 0, 0, 0.0, "No code found")
 
     # 1. Check executability
     if code_path and os.path.exists(code_path):
@@ -291,10 +291,7 @@ def evaluate_single_sample(pred: Dict, task_description: str = "") -> SRDDMetric
         consistency = 0.5  # Default value if no description
 
     # Calculate final reward
-    if executability == 0:
-        reward = -1.0
-    else:
-        reward = consistency * completeness  # alignment
+    reward = (executability + consistency + completeness) / 3
 
     return SRDDMetrics(
         executability=executability,

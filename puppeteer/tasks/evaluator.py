@@ -98,11 +98,8 @@ class BenchmarkEvaluator:
         consistency = torch.tensor(consistency, dtype=torch.float32, device=DEVICE)  
         completeness = torch.tensor(completeness, dtype=torch.float32, device=DEVICE)  
         metrics = {"consistency": consistency, "completeness": completeness, "executability": executability}
-        if executability:
-            alignment = consistency * completeness
-            return alignment, metrics
-        else:
-            return -1.0, metrics
+        reward = (executability + consistency + completeness) / 3
+        return reward, metrics
     
     @staticmethod
     def srdd_consistency(text, code):

@@ -215,7 +215,7 @@ class GraphReasoning:
             if self.task.get("type") == "MMLU-Pro":
                 transition = {
                 'state': reasoning_path.global_info.workflow.state,
-                'reward': 1 if BenchmarkEvaluator.check_mmlu(aggregated_answer, self.task.get("Answer")) else -1,
+                'reward': 1 if BenchmarkEvaluator.check_mmlu(aggregated_answer, self.task.get("Answer")) else 0,
                 'action': None,  
                 'next_state': None,
                 'done': True,
@@ -226,7 +226,7 @@ class GraphReasoning:
             elif self.task.get("type") == "GSM-Hard": 
                 transition = {
                 'state': reasoning_path.global_info.workflow.state,
-                'reward': 1 if BenchmarkEvaluator.check_gsm8k(aggregated_answer, self.task.get("Answer")) else -1,
+                'reward': 1 if BenchmarkEvaluator.check_gsm8k(aggregated_answer, self.task.get("Answer")) else 0,
                 'action': None,  
                 'next_state': None,
                 'done': True,

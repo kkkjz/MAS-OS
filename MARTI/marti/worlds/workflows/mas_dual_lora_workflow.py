@@ -1309,7 +1309,7 @@ async def workflow(
     
     if task_type.lower() in ["mmlu-pro", "mmlu_pro", "mmlu"]:
         # 使用宽松判分，传入options支持选项内容匹配
-        task_reward = 1.0 if evaluator.check_mmlu(final_answer, label, options=mmlu_options) else -1.0
+        task_reward = 1.0 if evaluator.check_mmlu(final_answer, label, options=mmlu_options) else 0.0
         
         # 保存结果到文件（类似 main_mas.py 的格式）
         try:
@@ -1329,7 +1329,7 @@ async def workflow(
         except Exception as e:
             logger.warning(f"[MMLU] Failed to save result: {e}")
     elif task_type.lower() in ["gsm-hard", "gsm8k", "gsm"]:
-        task_reward = 1.0 if evaluator.check_gsm8k(final_answer, label) else -1.0
+        task_reward = 1.0 if evaluator.check_gsm8k(final_answer, label) else 0.0
     elif task_type.lower() in ["scibench", "sci", "science"]:
         is_correct = evaluator.check_scibench(final_answer, label)
         task_reward = 1.0 if is_correct else 0.0

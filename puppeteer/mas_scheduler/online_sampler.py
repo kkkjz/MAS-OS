@@ -9,7 +9,6 @@ Online Sampler for MAS GRPO Training
 3. 收集 Agent 自反馈的 useful_count
 4. 输出 verl 兼容的 JSONL 格式
 
-参考：https://github.com/TsinghuaC3I/MARTI
 """
 
 from __future__ import annotations
@@ -286,7 +285,7 @@ class OnlineSampler:
             task_reward = evaluator_fn(final_answer, ground_truth)
         else:
             # 模拟评估
-            task_reward = random.choice([-1.0, 0.0, 0.5, 1.0])
+            task_reward = random.choice([0.0, 1.0])
         
         total_steps = len(step_records)
         
