@@ -1,5 +1,8 @@
 
 beautifulsoup4==4.13.5
+# Required by puppeteer/tools/web_search.py (imported unconditionally, so every
+# entry point that registers agents needs it).
+arxiv
 chromadb==0.5.7
 diskcache==5.6.3
 easydict==1.10
@@ -24,6 +27,9 @@ pyvis==0.3.2
 PyYAML==6.0
 Requests==2.32.5
 seaborn==0.13.2
+# Required by mas_scheduler.memer for the memory graph's semantic edges
+# (BAAI/bge-m3 embeddings, cosine similarity thresholded at tau).
+sentence-transformers>=2.7.0
 SpeechRecognition==3.10.4
 sympy==1.12
 tenacity==9.0.0

@@ -15,9 +15,11 @@ Example:
 Prerequisites:
     Start vLLM server first:
     python -m vllm.entrypoints.openai.api_server \
-        --model /root/autodl-tmp/Llama-3.1-8B-Instruct \
+        --model <YOUR_MODEL_PATH> \
         --port 8000 --trust-remote-code \
         --max-model-len 8192 --max-num-seqs 8
+
+    Then pass the same model id via --model (or export MAS_VLLM_MODEL).
 """
 from __future__ import annotations
 
@@ -56,33 +58,50 @@ from tasks import mmlu_pro, gsm_hard, srdd, creative_writing, scibench
 from tasks.evaluator import BenchmarkEvaluator
 
 
-def create_vllm_config(max_steps: int = 12) -> MASConfig:
+def create_vllm_config(
+    max_steps: int = 12,
+    model: str = "",
+    base_url: str = "",
+) -> MASConfig:
     """
     Create MAS config that uses local vLLM deployment.
-    
-    All agents will use the same local model deployed at http://localhost:8000
+
+    All agents will use the same local model served by vLLM.
+
+    Args:
+        max_steps: Maximum reasoning steps
+        model: Model id as registered in vLLM (falls back to $MAS_VLLM_MODEL)
+        base_url: vLLM OpenAI-compatible endpoint (falls back to $MAS_VLLM_BASE_URL)
     """
     config = MASConfig()
-    
+
     # Configure to use local vLLM server
     config.openai_api_key = "EMPTY"  # vLLM doesn't require real API key
-    config.openai_base_url = "http://localhost:8000/v1"
-    config.llm_model = "/root/autodl-tmp/Llama-3.1-8B-Instruct"  # Model name as registered in vLLM
-    
+    config.openai_base_url = (
+        base_url or os.environ.get("MAS_VLLM_BASE_URL") or "http://localhost:8000/v1"
+    )
+    config.llm_model = model or os.environ.get("MAS_VLLM_MODEL", "")
+    if not config.llm_model:
+        raise SystemExit(
+            "No vLLM model specified. Pass --model, or set $MAS_VLLM_MODEL to the "
+            "model id registered with your vLLM server (e.g. the path you passed "
+            "to `vllm serve`)."
+        )
+
     # Set max steps
     config.max_steps = max_steps
-    
+
     # Enable LLM-based components
     config.use_llm_scheduler = True
     config.use_llm_router = True
     config.use_llm_memer = True
-    
+
     # Disable feedback collection during evaluation
     config.collect_feedback = False
-    
+
     # Temperature for generation
     config.llm_temperature = 0.0
-    
+
     logger.info("=" * 60)
     logger.info("vLLM Configuration")
     logger.info(f"  Base URL: {config.openai_base_url}")
@@ -90,26 +109,37 @@ def create_vllm_config(max_steps: int = 12) -> MASConfig:
     logger.info(f"  Max steps: {config.max_steps}")
     logger.info(f"  Temperature: {config.llm_temperature}")
     logger.info("=" * 60)
-    
+
     return config
 
 
-def update_global_config_for_vllm(global_config: Dict[str, Any]) -> Dict[str, Any]:
+def update_global_config_for_vllm(
+    global_config: Dict[str, Any],
+    mas_config: Optional[MASConfig] = None,
+) -> Dict[str, Any]:
     """
     Update global config to use local vLLM for all agent API calls.
-    
-    This ensures that worker agents also use the local vLLM deployment.
+
+    This ensures that worker agents also use the local vLLM deployment, with the
+    same endpoint/model that create_vllm_config resolved.
     """
     if "api_keys" not in global_config:
         global_config["api_keys"] = {}
-    
+
+    base_url = (
+        getattr(mas_config, "openai_base_url", "")
+        or os.environ.get("MAS_VLLM_BASE_URL")
+        or "http://localhost:8000/v1"
+    )
+    model = getattr(mas_config, "llm_model", "") or os.environ.get("MAS_VLLM_MODEL", "")
+
     # Configure all agents to use local vLLM
     global_config["api_keys"]["openai_api_key"] = "EMPTY"
-    global_config["api_keys"]["openai_base_url"] = "http://localhost:8000/v1"
-    global_config["api_keys"]["openai_model"] = "/root/autodl-tmp/Llama-3.1-8B-Instruct"
-    
+    global_config["api_keys"]["openai_base_url"] = base_url
+    global_config["api_keys"]["openai_model"] = model
+
     logger.info("Updated global config to use local vLLM for all agents")
-    
+
     return global_config
 
 
@@ -127,8 +157,8 @@ class MASBenchmarkRunner:
         mas_config: Optional[MASConfig] = None,
     ):
         self.personas_path = personas_path
-        self.global_config = update_global_config_for_vllm(global_config)
         self.mas_config = mas_config or create_vllm_config()
+        self.global_config = update_global_config_for_vllm(global_config, self.mas_config)
         self.max_step_num = self.mas_config.max_steps
         
         logger.info("=" * 60)
@@ -549,15 +579,24 @@ def main():
                        help="Path to personas file")
     parser.add_argument("--resume", type=str, default=None,
                        help="Resume from existing results directory")
-    
+    parser.add_argument("--model", type=str, default="",
+                       help="Model id as registered in vLLM (default: $MAS_VLLM_MODEL)")
+    parser.add_argument("--base_url", type=str, default="",
+                       help="vLLM OpenAI-compatible endpoint "
+                            "(default: $MAS_VLLM_BASE_URL or http://localhost:8000/v1)")
+
     args = parser.parse_args()
-    
+
     # Load global config
     with open("config/global.yaml", "r") as f:
         global_config = yaml.safe_load(f)
-    
+
     # Create vLLM-based MAS config
-    mas_config = create_vllm_config(max_steps=args.max_steps)
+    mas_config = create_vllm_config(
+        max_steps=args.max_steps,
+        model=args.model,
+        base_url=args.base_url,
+    )
     
     # Create runner
     runner = MASBenchmarkRunner(args.personas, global_config, mas_config)

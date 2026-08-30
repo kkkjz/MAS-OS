@@ -244,10 +244,18 @@ def build_agent_registry(agents_dict: Dict[str, Any]) -> AgentRegistry:
     return AgentRegistry(specs)
 
 
-def _enhance_agent_prompt_for_mmlu(agent, agent_name: str, task_type: str) -> None:
+def _enhance_agent_prompt_for_mmlu(
+    agent, agent_name: str, task_type: str, enabled: bool = False
+) -> None:
     """
     针对 MMLU-Pro 任务，为特定 agent 增强提示词（和 MASReasoning 一致）。
+
+    **论文未描述此机制，默认关闭。** 仅在需要复现原先报告的 MMLU-Pro 数字时，
+    通过 MASConfig.enable_mmlu_prompt_injection=True 开启。
     """
+    if not enabled:
+        return
+
     # 只对 MMLU-Pro 任务进行增强
     if task_type.lower() not in ["mmlu-pro", "mmlu_pro", "mmlu"]:
         return
@@ -608,7 +616,12 @@ class LoRAMASReasoning:
                 self.global_info.memory_context = memory_context
             
             # 针对 MMLU-Pro 任务，为特定 agent 增强提示词（和 MASReasoning 一致）
-            _enhance_agent_prompt_for_mmlu(worker, chosen_agent, self.task.get("type", ""))
+            _enhance_agent_prompt_for_mmlu(
+                worker,
+                chosen_agent,
+                self.task.get("type", ""),
+                getattr(self.config, "enable_mmlu_prompt_injection", False),
+            )
             
             logger.info(f"[Worker] → {chosen_agent}")
             worker.activate(self.global_info, initial_dialog_history=worker.initial_dialog_history)
@@ -702,10 +715,180 @@ class LoRAMASReasoning:
 
         return self.final_answer, ground_truth
 
-    # ... (rest of the code remains the same)
+    def visualize_path(self) -> None:
+        """打印推理路径（agent 调用序列）。"""
+        logger.info("\n[Reasoning Path]")
+        for i, entry in enumerate(self.task_state.history):
+            logger.info(f"  Step {i+1}: {entry.agent} -> {str(entry.summary)[:80]}...")
+
+
+# =============================================================================
+# Benchmark Runner
+# =============================================================================
+
+class LoRAMASBenchmarkRunner:
+    """
+    使用训练好的 Scheduler/Router LoRA 适配器跑评测。
+
+    和 main_mas_vllm.MASBenchmarkRunner 结构一致，区别在于：
+    - 每个任务构造 LoRAMASReasoning（走 vLLM 的 LoRA 适配器），而非 MASReasoning
+    - 需要额外的 vllm_url / base_model 定位 LoRA 服务
+    """
+
+    def __init__(
+        self,
+        personas_path: str,
+        global_config: Dict[str, Any],
+        mas_config: Optional[MASConfig] = None,
+        vllm_url: str = "http://127.0.0.1:8000",
+        base_model: str = "",
+    ):
+        self.personas_path = personas_path
+        self.global_config = global_config
+        self.mas_config = mas_config or DEFAULT_MAS_CONFIG
+        self.vllm_url = vllm_url.rstrip("/")
+        self.base_model = base_model
+
+        self.max_step_num = self.global_config.get("graph", {}).get("max_step_num", 12)
+        self.mas_config.max_steps = self.max_step_num
+
+        # 只注册一次 agents（避免内存泄漏），每个任务只 reset
+        agent_global_registry.register_all_agents(self.personas_path)
+
+        logger.info("=" * 60)
+        logger.info("LoRA MAS Benchmark Runner Initialized")
+        logger.info(f"  Personas: {personas_path}")
+        logger.info(f"  Max steps: {self.max_step_num}")
+        logger.info(f"  vLLM URL: {self.vllm_url}")
+        logger.info(f"  Base model: {self.base_model}")
+        logger.info(f"  Registered {agent_global_registry.agent_num} agents")
+        logger.info("=" * 60)
+
+    def setup_reasoning(self, data_item: Dict[str, Any]):
+        """为单个任务准备 LoRAMASReasoning。"""
+        agent_global_registry.reset_all_agents()
+
+        agents = {}
+        for name in agent_global_registry.agent_names:
+            agent = agent_global_registry.get_agent_from_name(name)
+            if agent:
+                agents[name] = agent
+
+        logger.debug(f"Using {len(agents)} agents: {list(agents.keys())}")
+
+        log_manager = LogManager("./config/global.yaml", data_item.get("type", "unknown"))
+        workspace_path = log_manager.folder_path
+
+        reasoning = LoRAMASReasoning(
+            task=data_item,
+            agents=agents,
+            config=self.mas_config,
+            workspace_path=workspace_path,
+            log_manager=log_manager,
+            vllm_url=self.vllm_url,
+            base_model=self.base_model,
+        )
+
+        return reasoning, workspace_path
+
+    def run_reasoning(self, data_item: Dict[str, Any]) -> str:
+        """跑完一个任务，返回最终答案。"""
+        reasoning, workspace_path = self.setup_reasoning(data_item)
+
+        global_info = GlobalInfo(
+            path_id=0,
+            workpath=workspace_path,
+            task=data_item,
+        )
+        global_info.logger = logger
+
+        reasoning.start(global_info)
+
+        final_ans, _ = reasoning.n_step(self.max_step_num)
+
+        reasoning.visualize_path()
+
+        return final_ans
 
 
 # ========== 评测函数 ==========
+
+
+def run_mmlu_pro(runner, evaluator, results_dir, mode, data_limit, resume_from=None):
+    """评测 MMLU-Pro 数据集。"""
+    import pandas as pd
+    import string
+    from tqdm import tqdm
+
+    path = os.path.join("data", "MMLU-Pro", f"{mode}.parquet")
+    data = pd.read_parquet(path)
+    if data_limit:
+        data = data[:data_limit]
+
+    result_path = os.path.join(results_dir, f"MMLU-Pro_{mode}_lora.jsonl")
+
+    # 断点续跑：读取已有结果
+    done_ids = set()
+    acc = 0
+    if os.path.exists(result_path):
+        with open(result_path, "r", encoding="utf-8") as f:
+            for line in f:
+                try:
+                    record = json.loads(line.strip())
+                    done_ids.add(record["id"])
+                    if record.get("correct", False):
+                        acc += 1
+                except Exception:
+                    pass
+        logger.info(f"[Resume] Found {len(done_ids)} existing results. Continuing...")
+
+    total = len(data)
+    logger.info(f"Running MMLU-Pro ({mode}), {total} samples total, {len(done_ids)} already done")
+
+    with open(result_path, "a", encoding="utf-8") as fd:
+        for idx, row in tqdm(data.iterrows(), total=total):
+            if row["question_id"] in done_ids:
+                continue
+
+            options = [
+                f"{letter}: {op}"
+                for letter, op in zip(string.ascii_uppercase, row["options"])
+            ]
+            prompt = (
+                f"The following are multiple choice questions (with answers) "
+                f"about {row['category']}."
+            )
+            question = prompt + "\n" + row["question"] + "\n" + " ".join(options)
+
+            task = {
+                "type": "MMLU-Pro",
+                "Question": question,
+                "Answer": row["answer"],
+                "id": row["question_id"],
+            }
+
+            final_ans = runner.run_reasoning(task)
+            flag = evaluator.check_mmlu(final_ans, task["Answer"], options=options)
+
+            if flag:
+                acc += 1
+
+            record = {
+                "id": task["id"],
+                "pred": final_ans,
+                "gold": task["Answer"],
+                "correct": flag,
+            }
+            fd.write(json.dumps(record, ensure_ascii=False) + "\n")
+            fd.flush()
+
+            logger.info(f"Sample {idx + 1}/{total}: {'✓' if flag else '✗'}")
+
+    final_acc = acc / total if total > 0 else 0
+    logger.info(f"\n{'='*40}")
+    logger.info(f"MMLU-Pro Final Accuracy: {final_acc:.4f} ({acc}/{total})")
+    logger.info(f"Results saved to: {result_path}")
+
 
 def run_gsm_hard(runner, evaluator, results_dir, mode, data_limit):
     """评测 GSM-Hard 数据集。"""

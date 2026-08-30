@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import os
 import sys
+import glob
 import json
 import logging
 from typing import Any, Dict, List, Optional
@@ -46,7 +47,7 @@ try:
     from puppeteer.mas_scheduler.task_state import MASTaskState, AgentResult
     from puppeteer.mas_scheduler.agent_feedback import (
         AgentFeedbackCollector,
-        run_agent_with_parallel_feedback,
+        extract_agent_output_text,
         MemoryUsefulnessFeedback,
     )
     from puppeteer.agent.register.register import agent_global_registry
@@ -60,7 +61,14 @@ except ImportError as e:
     PUPPETEER_AVAILABLE = False
 
 
-# ========== Scheduler Prompt (matches scheduler.py) ==========
+# ========== Prompt builders ==========
+# The real builders live in puppeteer (single source of truth) so the prompts
+# used during training are byte-for-byte identical to the ones the inference
+# path sends. This file previously kept its own copies, which had already
+# drifted. Imported lazily because puppeteer may not be importable at module
+# load time in a Ray worker.
+
+
 def format_scheduler_prompt(
     question: str,
     agent_specs_prompt: str,
@@ -68,60 +76,26 @@ def format_scheduler_prompt(
     pre_agent: Optional[str] = None,
     pre_mem: str = "",
 ) -> tuple[str, str]:
-    """
-    和 puppeteer/mas_scheduler/scheduler.py 的 _llm_choose 完全一致。
-    
-    返回 (system_prompt, user_prompt) 元组，以便正确使用 chat messages 格式。
-    这对于 Llama-3 等模型的 chat template 非常重要。
-    """
-    progress_text = sum_memory if sum_memory else "Task just started. No agents have worked yet."
-    pre_agent_text = pre_agent if pre_agent else "None (first step)"
-    
-    # System prompt - 和 scheduler.py 一致
-    system_prompt = f"""You are a scheduler for a multi-agent reasoning system.
+    """Thin wrapper over puppeteer's build_scheduler_prompt (kept for the
+    existing call sites below). Returns (system_prompt, user_prompt)."""
+    from puppeteer.mas_scheduler.scheduler import build_scheduler_prompt
 
-AVAILABLE AGENTS:
-{agent_specs_prompt}
-
-YOUR TASK:
-Read the task progress description and decide which agent should work next.
-
-DECISION GUIDELINES:
-- If no work has been done → start with a planning/reasoning agent
-- If there's a plan but no execution → choose an execution agent (tool, search, code)
-- If execution produced results → choose a reasoning agent to analyze
-- If analysis suggests problems → choose appropriate agent to fix
-- If reasoning concluded with answer → choose TerminatorAgent to finalize
-- If task is clearly complete → return DONE
-
-CRITICAL: 
-- Read the progress description carefully
-- Understand the semantic meaning, not just keywords
-- Consider what's been accomplished vs what's still needed
-- DO NOT select the same agent consecutively (avoid repeating PREVIOUS AGENT)
-- Vary agent selection to make progress; repetition wastes steps
-
-Reply with EXACTLY one word: one of the agent names, or DONE"""
-
-    # Include pre_mem (last step's memory summary) for better context
-    last_step_info = ""
-    if pre_agent and pre_mem:
-        last_step_info = f"\nLAST STEP OUTPUT ({pre_agent}): {pre_mem[:300]}"
-
-    # User prompt - 和 scheduler.py 一致
-    user_prompt = f"""QUESTION: {question}
-
-PREVIOUS AGENT: {pre_agent_text}{last_step_info}
-
-CURRENT PROGRESS:
-{progress_text}
-
-Which agent should work next? Reply with one word only."""
-
-    return system_prompt, user_prompt
+    return build_scheduler_prompt(
+        question=question,
+        agent_specs_prompt=agent_specs_prompt,
+        sum_memory=sum_memory,
+        pre_agent=pre_agent,
+        pre_mem=pre_mem,
+    )
 
 
-# ========== Router Prompt (matches router.py) ==========
+def format_memory_candidates(topm_nodes) -> str:
+    """Thin wrapper over puppeteer's format_memory_candidates."""
+    from puppeteer.mas_scheduler.router import format_memory_candidates as _fmt
+
+    return _fmt(topm_nodes)
+
+
 def format_router_prompt(
     question: str,
     now_agent: str,
@@ -129,62 +103,23 @@ def format_router_prompt(
     candidates: str,
     pre_agent: Optional[str] = None,
     pre_mem: str = "",
-    top_n: int = 5,
+    top_n: int = 3,
     agent_description: str = "",
 ) -> tuple[str, str]:
-    """
-    和 puppeteer/mas_scheduler/router.py 的 _llm_route 完全一致。
-    
-    返回 (system_prompt, user_prompt) 元组，以便正确使用 chat messages 格式。
-    """
-    # Build previous step context (和 puppeteer/router.py 一致)
-    prev_context = ""
-    if pre_agent:
-        prev_context = f"Previous agent: {pre_agent}\n"
-        if pre_mem:
-            prev_context += f"Previous step summary: {pre_mem[:200]}...\n" if len(pre_mem) > 200 else f"Previous step summary: {pre_mem}\n"
+    """Thin wrapper over puppeteer's build_router_prompt (kept for the existing
+    call sites below). Returns (system_prompt, user_prompt)."""
+    from puppeteer.mas_scheduler.router import build_router_prompt
 
-    # Agent description context (第三人称)
-    agent_desc_text = ""
-    if agent_description:
-        agent_desc_text = f"\nABOUT {now_agent}: {agent_description}\n"
-
-    # System prompt
-    system_prompt = f"""You are a memory router for a multi-agent reasoning system.
-Your job is to select ONLY the truly relevant memories for the current agent.
-{agent_desc_text}
-RULES:
-- Select between 1 and {top_n} memories (inclusive)
-- You MUST select at least 1 memory
-- Do NOT select more than {top_n} memories
-- Only select memories that genuinely help {now_agent} do its job
-- Do NOT output duplicate indices (each index may appear at most once)
-- Do NOT pad the list - if only 1 or 2 memories are useful, that's fine
-- Quality over quantity
-
-GUIDELINES:
-- Consider what specific information this agent type needs based on its description above
-- Prioritize memories directly relevant to the agent's task
-- Previous agent's output is often highly relevant
-- Avoid redundant or tangential memories
-
-OUTPUT FORMAT:
-Reply with comma-separated indices only. Indices must be unique (no repeats like "0,0" or "1,1"). Examples:
-- If only 1 useful: "2"
-- If 2 useful: "0, 3"  
-- If 3 useful: "1, 2, 4" """
-
-    # User prompt
-    user_prompt = f"""Task question: {question}
-Current agent: {now_agent}
-{prev_context}Global progress: {sum_memory if sum_memory else 'None'}
-
-Available memories (select 1-{top_n} that are truly useful):
-{candidates}
-
-Which memories should {now_agent} see? Reply with indices only:"""
-
-    return system_prompt, user_prompt
+    return build_router_prompt(
+        question=question,
+        now_agent=now_agent,
+        sum_memory=sum_memory,
+        candidates=candidates,
+        pre_agent=pre_agent,
+        pre_mem=pre_mem,
+        top_n=top_n,
+        agent_description=agent_description,
+    )
 
 
 def build_agent_registry(agents_dict: Dict[str, Any]) -> AgentRegistry:
@@ -265,20 +200,32 @@ def parse_router_response(response: str, max_idx: int) -> List[int]:
     return indices
 
 
-def _enhance_agent_prompt_for_mmlu(agent: Any, agent_name: str, task_type: str) -> None:
+def _enhance_agent_prompt_for_mmlu(
+    agent: Any,
+    agent_name: str,
+    task_type: str,
+    enabled: bool = False,
+) -> None:
     """
     针对 MMLU-Pro 任务，为特定 agent 增强提示词（和 MASReasoning._enhance_agent_prompt_for_mmlu 一致）。
-    
+
+    **论文未描述此机制，默认关闭。** 仅在需要复现原先报告的 MMLU-Pro 数字时，通过
+    workflow_args.enable_mmlu_prompt_injection=True 开启。
+
     对于选择题任务，需要强调：
     1. 只输出选项字母（A-J）
     2. 不要输出数字、金额或其他格式
     3. 确保最终答案是单个大写字母
-    
+
     Args:
         agent: 要增强的 agent 实例
         agent_name: agent 名称
         task_type: 任务类型
+        enabled: 是否启用（默认 False = 论文行为）
     """
+    if not enabled:
+        return
+
     # 只对 MMLU-Pro 任务进行增强
     if task_type.lower() not in ["mmlu-pro", "mmlu_pro", "mmlu"]:
         return
@@ -502,6 +449,7 @@ async def workflow(
     global Memer, MemoryNode
     global AgentRegistry, AgentSpec
     global MASTaskState, AgentResult
+    global AgentFeedbackCollector, extract_agent_output_text, MemoryUsefulnessFeedback
     global agent_global_registry, GlobalInfo, LogManager, BenchmarkEvaluator
     if not PUPPETEER_AVAILABLE:
         try:
@@ -514,6 +462,11 @@ async def workflow(
             from puppeteer.mas_scheduler.memer import Memer, MemoryNode
             from puppeteer.mas_scheduler.scheduler import AgentRegistry, AgentSpec
             from puppeteer.mas_scheduler.task_state import MASTaskState, AgentResult
+            from puppeteer.mas_scheduler.agent_feedback import (
+                AgentFeedbackCollector,
+                extract_agent_output_text,
+                MemoryUsefulnessFeedback,
+            )
             from puppeteer.agent.register.register import agent_global_registry
             from puppeteer.agent.agent_info.global_info import GlobalInfo
             from puppeteer.utils.log_manager import LogManager
@@ -599,6 +552,18 @@ async def workflow(
             mas_config.top_n = int(workflow_args["top_n"])
     except Exception:
         pass
+    # Non-paper extensions, off by default. Enable only to reproduce the
+    # originally reported numbers.
+    enable_mmlu_injection = bool(
+        workflow_args.get("enable_mmlu_prompt_injection", False)
+    )
+    try:
+        mas_config.enable_mmlu_prompt_injection = enable_mmlu_injection
+        mas_config.enable_role_based_routing = bool(
+            workflow_args.get("enable_role_based_routing", False)
+        )
+    except Exception:
+        pass
     
     from puppeteer.mas_scheduler.llm import MASLLMClient
     try:
@@ -629,21 +594,34 @@ async def workflow(
     )
     global_info.logger = logger
     
-    # ---------- Debug: Scheduler input logging ----------
-    # 将每步 scheduler 的完整输入写入调试文件（固定路径，方便查找）
-    debug_log_dir = "/root/autodl-tmp/MAS_sharememory/MARTI/logs/scheduler_debug"
-    os.makedirs(debug_log_dir, exist_ok=True)
-    debug_log_path = os.path.join(debug_log_dir, f"prompt_{prompt_id}.txt")
-    logger.info(f"[MAS] Scheduler debug log will be saved to: {debug_log_path}")
-    
-    # ---------- Results logging (类似 main_mas.py) ----------
-    results_log_dir = "/root/autodl-tmp/MAS_sharememory/MARTI/logs/training_results"
-    os.makedirs(results_log_dir, exist_ok=True)
-    results_log_path = os.path.join(results_log_dir, f"{task_type}_results.jsonl")
-    logger.info(f"[MAS] Training results will be saved to: {results_log_path}")
-    
+    # ---------- Logging directories ----------
+    # Root for debug/result logs. Defaults to <MARTI_ROOT>/logs; override with
+    # workflow_args.log_dir. Never hardcode an absolute path here: this runs on
+    # the live training path and a non-writable directory would abort the run.
+    log_root = str(workflow_args.get("log_dir", "") or "").strip()
+    if not log_root:
+        log_root = os.path.join(MARTI_ROOT, "logs")
+
+    debug_log_path = None
+    results_log_path = None
+    try:
+        debug_log_dir = os.path.join(log_root, "scheduler_debug")
+        os.makedirs(debug_log_dir, exist_ok=True)
+        debug_log_path = os.path.join(debug_log_dir, f"prompt_{prompt_id}.txt")
+        logger.info(f"[MAS] Scheduler debug log will be saved to: {debug_log_path}")
+
+        results_log_dir = os.path.join(log_root, "training_results")
+        os.makedirs(results_log_dir, exist_ok=True)
+        results_log_path = os.path.join(results_log_dir, f"{task_type}_results.jsonl")
+        logger.info(f"[MAS] Training results will be saved to: {results_log_path}")
+    except OSError as e:
+        # Diagnostics must never take down training.
+        logger.warning(f"[MAS] Could not create log dirs under {log_root}: {e}. Logging disabled.")
+
     def _log_scheduler_input(step_idx: int, sys_prompt: str, user_prompt: str, output: str):
         """将 scheduler 输入和输出写入调试文件"""
+        if not debug_log_path:
+            return
         try:
             with open(debug_log_path, "a", encoding="utf-8") as f:
                 f.write(f"\n{'='*60}\n")
@@ -663,9 +641,11 @@ async def workflow(
         reward_cfg = MASRewardConfig(
             alpha=float(workflow_args.get("router_alpha", MASRewardConfig().alpha)),
             eta=float(workflow_args.get("router_eta", MASRewardConfig().eta)),
-            gamma_time=float(workflow_args.get("gamma_time", MASRewardConfig().gamma_time)),
             lambda_tok=float(workflow_args.get("lambda_tok", MASRewardConfig().lambda_tok)),
             reward_clip=float(workflow_args.get("reward_clip", MASRewardConfig().reward_clip)),
+            over_budget_penalty=float(
+                workflow_args.get("over_budget_penalty", MASRewardConfig().over_budget_penalty)
+            ),
         )
     except Exception:
         reward_cfg = MASRewardConfig()
@@ -738,17 +718,18 @@ async def workflow(
     
     # workflow args
     train_start_step = 1
-    enable_parallel_feedback = True
-    feedback_timeout = 120.0
     try:
         train_start_step = int(workflow_args.get("train_start_step", 1))
     except Exception:
         train_start_step = 1
-    enable_parallel_feedback = bool(workflow_args.get("enable_parallel_feedback", True))
-    try:
-        feedback_timeout = float(workflow_args.get("feedback_timeout", 120.0))
-    except Exception:
-        feedback_timeout = 120.0
+    # Post-hoc memory-usefulness feedback (paper Eq. 11). `enable_parallel_feedback`
+    # is the legacy key for the same switch and is still honoured.
+    enable_posthoc_feedback = bool(
+        workflow_args.get(
+            "enable_posthoc_feedback",
+            workflow_args.get("enable_parallel_feedback", True),
+        )
+    )
     
     naturally_finished = False  # Track if task finished naturally (和 puppeteer 一致)
     
@@ -835,11 +816,8 @@ async def workflow(
         chosen_agent_desc = chosen_agent_spec.description if chosen_agent_spec else ""
         
         if topm_nodes:
-            candidates_text = "\n".join([
-                f"[{idx}] ({node.node_type}): {node.summary}"
-                for idx, node in enumerate(topm_nodes)
-            ])
-            
+            candidates_text = format_memory_candidates(topm_nodes)
+
             router_sys_prompt, router_user_prompt = format_router_prompt(
                 question=question,
                 now_agent=chosen_agent,
@@ -987,7 +965,7 @@ async def workflow(
             global_info.memory_context = memory_context
         
         # 针对 MMLU-Pro 任务，为特定 agent 增强提示词（和 MASReasoning._step 一致）
-        _enhance_agent_prompt_for_mmlu(worker, chosen_agent, task_type)
+        _enhance_agent_prompt_for_mmlu(worker, chosen_agent, task_type, enable_mmlu_injection)
         
         # ===== 调用 Worker Agent (外部 API) + 并行自反馈（useful_count）=====
         logger.info(f"  → Agent: {chosen_agent}")
@@ -1007,35 +985,26 @@ async def workflow(
         task_context = task_state.sum_memory if getattr(task_state, "sum_memory", "") else ""
 
         try:
+            current_action, terminated = worker.take_action(
+                global_info,
+                external_tools_enabled=True,
+            )
+
             if (
-                enable_parallel_feedback
+                enable_posthoc_feedback
                 and feedback_collector is not None
                 and len(routed_memories_payload) > 0
             ):
-                def agent_action_fn():
-                    return worker.take_action(
-                        global_info,
-                        external_tools_enabled=True,
-                    )
-
-                def feedback_fn():
-                    return feedback_collector.collect_feedback_parallel(
-                        agent_name=chosen_agent,
-                        step_idx=step_1idx,
-                        task_context=task_context,
-                        question=question,
-                    )
-
-                (current_action, terminated), feedback_result = run_agent_with_parallel_feedback(
-                    agent_action_fn=agent_action_fn,
-                    feedback_fn=feedback_fn,
-                    timeout=feedback_timeout,
+                # 论文 Eq. 11：active agent 完成工作**之后**，对每条被分配的记忆返回
+                # u_i。判定器必须看到 agent 的实际输出，因此这一步只能串行。
+                feedback_result = feedback_collector.collect_feedback_posthoc(
+                    agent_name=chosen_agent,
+                    step_idx=step_1idx,
+                    question=question,
+                    agent_output=extract_agent_output_text(current_action),
+                    task_context=task_context,
                 )
             else:
-                current_action, terminated = worker.take_action(
-                    global_info,
-                    external_tools_enabled=True,
-                )
                 feedback_result = MemoryUsefulnessFeedback(
                     routed_count=len(routed_memories_payload),
                     useful_count=0,
@@ -1167,11 +1136,8 @@ async def workflow(
             concluder_desc = concluder_spec.description if concluder_spec else ""
             
             if topm_nodes:
-                candidates_text = "\n".join([
-                    f"[{idx}] ({node.node_type}): {node.summary}"
-                    for idx, node in enumerate(topm_nodes)
-                ])
-                
+                candidates_text = format_memory_candidates(topm_nodes)
+
                 router_sys_prompt, router_user_prompt = format_router_prompt(
                     question=question,
                     now_agent=concluder_name,
@@ -1236,10 +1202,17 @@ async def workflow(
                     logger.warning(f"[MAS] Router failed for force concluder: {e}")
             
             # 针对 MMLU-Pro 任务增强提示词（和 MASReasoning._force_final_answer 一致）
-            _enhance_agent_prompt_for_mmlu(concluder_agent, concluder_name, task_type)
-            
+            _enhance_agent_prompt_for_mmlu(
+                concluder_agent, concluder_name, task_type, enable_mmlu_injection
+            )
+
             # 对于MMLU任务，在强制生成最终答案时添加额外的强制要求
-            if task_type.lower() in ["mmlu-pro", "mmlu_pro", "mmlu"] and hasattr(concluder_agent, 'role_prompt'):
+            # （论文未描述，随 enable_mmlu_prompt_injection 一同开关）
+            if (
+                enable_mmlu_injection
+                and task_type.lower() in ["mmlu-pro", "mmlu_pro", "mmlu"]
+                and hasattr(concluder_agent, 'role_prompt')
+            ):
                 force_answer_instruction = (
                     "\n\n**URGENT: YOU MUST OUTPUT A FINAL ANSWER NOW!**\n"
                     "This is the LAST step. You MUST provide a definitive answer.\n"
@@ -1335,7 +1308,46 @@ async def workflow(
         task_reward = 1.0 if is_correct else 0.0
         # DEBUG: 打印详细的判分信息
         logger.info(f"[DEBUG] SciBench Check: pred='{final_answer[:50]}...' | gold='{label}' | correct={is_correct}")
+    elif task_type.lower() in ["srdd"]:
+        # 论文 Appendix A：SRDD 的 R_task 是 Completeness / Executability /
+        # Consistency 三分量的算术平均，evaluator.check_srdd 已实现该定义。
+        #
+        # 注意 check_srdd(code_path, text) 要的是**代码文件**路径（内部 read_code
+        # 用 os.path.isfile，executability 直接 `python {path}`），不是工作目录。
+        # 优先用 agent 落盘时记录的 global_info.code_path；若为空则回退到扫描
+        # workpath 下的 agent-main_*.py（见 utils/file_utils.write_file 的命名）。
+        #
+        # check_srdd 会起子进程跑 executability，且 consistency 依赖 embedding
+        # API——两者都不能让训练崩掉，故整体包 try/except。
+        try:
+            code_path = getattr(global_info, "code_path", "") or ""
+            if not code_path or not os.path.isfile(code_path):
+                candidates = sorted(
+                    glob.glob(os.path.join(global_info.workpath, "agent-main*.py"))
+                )
+                code_path = candidates[-1] if candidates else ""
+
+            if not code_path:
+                logger.warning(
+                    f"[SRDD] No generated code file found under {global_info.workpath}; reward 0.0"
+                )
+                task_reward = 0.0
+            else:
+                reward_t, srdd_metrics = evaluator.check_srdd(code_path, question)
+                task_reward = float(reward_t.item()) if hasattr(reward_t, "item") else float(reward_t)
+                _fmt = {
+                    k: round(float(v.item()) if hasattr(v, "item") else float(v), 4)
+                    for k, v in (srdd_metrics or {}).items()
+                }
+                logger.info(f"[SRDD] reward={task_reward:.4f} components={_fmt} path={code_path}")
+        except Exception as e:
+            logger.warning(f"[SRDD] check_srdd failed ({e}); falling back to reward 0.0")
+            task_reward = 0.0
     else:
+        logger.warning(
+            f"[MAS] No R_task defined for task_type='{task_type}'; reward will be 0.0. "
+            "Training with an all-zero reward signal provides no learning signal."
+        )
         task_reward = 0.0
 
     # Summarize result

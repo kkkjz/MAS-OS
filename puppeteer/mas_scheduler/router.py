@@ -20,6 +20,89 @@ from .memer import MemoryNode
 logger = logging.getLogger("MAS")
 
 
+def format_memory_candidates(topm_nodes: List[MemoryNode]) -> str:
+    """Render M^candidate_t as the indexed list shown to the allocator policy.
+
+    Single source of truth for the candidate line format, so the prompt used at
+    inference matches the one recorded for training byte-for-byte.
+    """
+    return "\n".join(
+        f"[{idx}] ({node.node_type}): {node.summary}"
+        for idx, node in enumerate(topm_nodes)
+    )
+
+
+def build_router_prompt(
+    question: str,
+    now_agent: str,
+    sum_memory: str,
+    candidates: str,
+    pre_agent: Optional[str] = None,
+    pre_mem: str = "",
+    top_n: int = 3,
+    agent_description: str = "",
+) -> tuple[str, str]:
+    """Build the Context Allocator prompt as a (system, user) pair.
+
+    This is the single source of truth for the allocator prompt: it is both what
+    `MASRouter._llm_route` sends to the policy and what callers record as the
+    training prompt.
+
+    Observation follows paper Eq. 9:
+        o^con_t = [x, M^candidate_t, M^global_{t-1}, a_{sigma_t}]
+    """
+    # Agent description 上下文（第三人称）
+    agent_desc_text = ""
+    if agent_description:
+        agent_desc_text = f"\nABOUT {now_agent}: {agent_description}\n"
+
+    system_prompt = f"""You are a memory router for a multi-agent reasoning system.
+Your job is to select ONLY the truly relevant memories for the current agent.
+{agent_desc_text}
+RULES:
+- Select between 1 and {top_n} memories (inclusive)
+- You MUST select at least 1 memory
+- Do NOT select more than {top_n} memories
+- Only select memories that genuinely help {now_agent} do its job
+- Do NOT output duplicate indices (each index may appear at most once)
+- Do NOT pad the list - if only 1 or 2 memories are useful, that's fine
+- Quality over quantity
+
+GUIDELINES:
+- Consider what specific information this agent type needs based on its description above
+- Prioritize memories directly relevant to the agent's task
+- Previous agent's output is often highly relevant
+- Avoid redundant or tangential memories
+
+OUTPUT FORMAT:
+Reply with comma-separated indices only. Indices must be unique (no repeats like "0,0" or "1,1"). Examples:
+- If only 1 useful: "2"
+- If 2 useful: "0, 3"
+- If 3 useful: "1, 2, 4" """
+
+    # Build previous step context
+    prev_context = ""
+    if pre_agent:
+        prev_context = f"Previous agent: {pre_agent}\n"
+        if pre_mem:
+            prev_context += (
+                f"Previous step summary: {pre_mem[:200]}...\n"
+                if len(pre_mem) > 200
+                else f"Previous step summary: {pre_mem}\n"
+            )
+
+    user_prompt = f"""Task question: {question}
+Current agent: {now_agent}
+{prev_context}Global progress: {sum_memory if sum_memory else 'None'}
+
+Available memories (select 1-{top_n} that are truly useful):
+{candidates}
+
+Which memories should {now_agent} see? Reply with indices only:"""
+
+    return system_prompt, user_prompt
+
+
 class MASRouter:
     """
     Router that selects memories for the current agent via LLM.
@@ -33,11 +116,10 @@ class MASRouter:
     - topm_nodes: TopM candidate memory nodes from Memer
     
     Output: TopN memory items (dict format) for the current agent
-    
-    Special rules:
+
+    Special rules (only when config.enable_role_based_routing is True — these
+    bypass the learned policy and are not part of the paper's method):
     - For planning agents: prioritize failed verification results
-    - For reasoning agents: prioritize recent reasoning context
-    - For tool agents: prioritize plans and parameters
     - For termination agents: prioritize answers and conclusions
     """
     
@@ -78,23 +160,25 @@ class MASRouter:
             return []
         
         question = task.get("Question", task.get("question", str(task)))
-        
+
         logger.debug(f"[Router] Routing for {now_agent}, {len(topm_nodes)} candidates")
         logger.debug(f"[Router] Previous agent: {pre_agent}, pre_mem: {pre_mem[:100] if pre_mem else 'None'}...")
+
+        # Non-paper extension, off by default: hand-written rules that bypass the
+        # learned allocation policy pi_phi entirely for planner/terminator agents.
+        # Enable via config.enable_role_based_routing only to reproduce the
+        # originally reported numbers.
+        if getattr(self.config, "enable_role_based_routing", False):
+            agent_lower = now_agent.lower()
+
+            if "planner" in agent_lower or "planning" in agent_lower:
+                return self._route_for_planner(topm_nodes, pre_agent, pre_mem)
+
+            if "terminator" in agent_lower:
+                return self._route_for_terminator(topm_nodes)
         
-        # Special handling for certain agent types
-        agent_lower = now_agent.lower()
-        
-        # Special rule: if previous agent was a verifier/critic and current is planner,
-        # make sure to include the verification result
-        if "planner" in agent_lower or "planning" in agent_lower:
-            return self._route_for_planner(topm_nodes, pre_agent, pre_mem)
-        
-        if "terminator" in agent_lower:
-            return self._route_for_terminator(topm_nodes)
-        
-        # Try LLM-based routing
-        if self._llm is not None and self.config.use_llm_router:
+        # Try LLM-based routing (the paper's allocation policy pi_phi)
+        if self.config.use_llm_router and getattr(self._llm, "is_available", False):
             routed = self._llm_route(question, now_agent, sum_memory, topm_nodes, pre_agent, pre_mem, agent_description)
             if routed:
                 logger.debug(f"[Router] LLM routed {len(routed)} memories")
@@ -212,56 +296,16 @@ class MASRouter:
     ) -> Optional[List[Dict]]:
         """Use LLM to select the most relevant memories."""
         try:
-            # Build candidate list
-            candidates = []
-            for idx, node in enumerate(topm_nodes):
-                candidates.append(f"[{idx}] ({node.node_type}) {node.summary}")
-            candidates_text = "\n".join(candidates)
-            
-            # Agent description 上下文（第三人称）
-            agent_desc_text = ""
-            if agent_description:
-                agent_desc_text = f"\nABOUT {now_agent}: {agent_description}\n"
-            
-            system_prompt = f"""You are a memory router for a multi-agent reasoning system.
-Your job is to select ONLY the truly relevant memories for the current agent.
-{agent_desc_text}
-RULES:
-- Select between 1 and {self.config.top_n} memories (inclusive)
-- You MUST select at least 1 memory
-- Do NOT select more than {self.config.top_n} memories
-- Only select memories that genuinely help {now_agent} do its job
- - Do NOT output duplicate indices (each index may appear at most once)
-- Do NOT pad the list - if only 1 or 2 memories are useful, that's fine
-- Quality over quantity
-
-GUIDELINES:
-- Consider what specific information this agent type needs based on its description above
-- Prioritize memories directly relevant to the agent's task
-- Previous agent's output is often highly relevant
-- Avoid redundant or tangential memories
-
-OUTPUT FORMAT:
- Reply with comma-separated indices only. Indices must be unique (no repeats like "0,0" or "1,1"). Examples:
-- If only 1 useful: "2"
-- If 2 useful: "0, 3"  
-- If 3 useful: "1, 2, 4" """
-
-            # Build previous step context
-            prev_context = ""
-            if pre_agent:
-                prev_context = f"Previous agent: {pre_agent}\n"
-                if pre_mem:
-                    prev_context += f"Previous step summary: {pre_mem[:200]}...\n" if len(pre_mem) > 200 else f"Previous step summary: {pre_mem}\n"
-
-            user_prompt = f"""Task question: {question}
-Current agent: {now_agent}
-{prev_context}Global progress: {sum_memory if sum_memory else 'None'}
-
-Available memories (select 1-{self.config.top_n} that are truly useful):
-{candidates_text}
-
-Which memories should {now_agent} see? Reply with indices only:"""
+            system_prompt, user_prompt = build_router_prompt(
+                question=question,
+                now_agent=now_agent,
+                sum_memory=sum_memory,
+                candidates=format_memory_candidates(topm_nodes),
+                pre_agent=pre_agent,
+                pre_mem=pre_mem,
+                top_n=self.config.top_n,
+                agent_description=agent_description,
+            )
 
             response = self._llm.chat(system_prompt, user_prompt, temperature=0.0)
             selected_indices = self._parse_indices(response, len(topm_nodes))

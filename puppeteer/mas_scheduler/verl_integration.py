@@ -50,33 +50,41 @@ logger = logging.getLogger("MAS")
 
 @dataclass
 class MASRewardConfig:
-    """Configuration for MAS reward computation."""
-    
-    # Router reward: r_rou = α * h_{i,t} + η * R^task
-    alpha: float = 1.0        # Weight for hit rate
-    eta: float = 0.5          # Weight for task reward on router
-    
-    # Scheduler reward: r_sch = w_{i,t} * R^task - λ_tok * c_{i,t}
-    gamma_time: float = 2.0   # Exponent for time weight w = (t/T)^γ
-    lambda_tok: float = 0.001 # Token cost penalty
-    
-    # Normalization
-    reward_clip: float = 10.0
+    """Configuration for MAS reward computation.
+
+    Defaults follow the MAS-OS paper (Appendix A).
+    """
+
+    # Context Allocator reward (Eq. 12): R_context = α * R_agent + η * R_task
+    alpha: float = 0.25       # Weight for the agent hit-rate term
+    eta: float = 1.0          # Weight for the terminal task reward
+
+    # Agent Scheduler reward (Eq. 13): R_scheduler = R_task - λ * c_t
+    lambda_tok: float = 5e-5  # Per-step token cost penalty
+
+    # Rewards are clipped to [-2, 2]
+    reward_clip: float = 2.0
+
+    # Non-paper extension: penalty applied when the allocator returns more than
+    # K memories. 0.0 disables it (paper behaviour); set > 0 to re-enable.
+    over_budget_penalty: float = 0.0
 
 
 class SchedulerRewardFunction:
     """
     Scheduler reward function for verl integration.
-    
-    Formula: r^sch_{i,t} = w_{i,t} * R^task_i - λ_tok * c_{i,t}
-    where w_{i,t} = (t / T_i)^γ
-    
+
+    Formula (paper Eq. 13): r^sch_{i,t} = R^task_i - λ_tok * c_{i,t}
+
+    Note there is no time-weight term: every step of a trajectory shares the
+    same terminal task reward and is charged only for the tokens it consumed.
+
     This is designed to be used with verl's reward function interface.
     """
-    
+
     def __init__(self, config: MASRewardConfig = None):
         self.config = config or MASRewardConfig()
-    
+
     def __call__(
         self,
         data_item: Dict[str, Any],
@@ -85,42 +93,35 @@ class SchedulerRewardFunction:
     ) -> float:
         """
         Compute reward for a scheduler decision.
-        
+
         Args:
             data_item: The task data (contains task_reward after evaluation)
             response: The scheduler's output (agent name)
-            step_info: Additional info (step_idx, total_steps, token_count)
-            
+            step_info: Additional info (token_count, task_reward). step_idx and
+                total_steps may be present but do not affect the reward.
+
         Returns:
             Reward value
         """
         # Extract from step_info
-        t = step_info.get("step_idx", 1)
-        T = step_info.get("total_steps", 1)
         c_t = step_info.get("token_count", 0)
         R_task = step_info.get("task_reward", 0.0)
-        
-        # Time weight: w_{i,t} = (t / T_i)^γ
-        w_it = (t / max(T, 1)) ** self.config.gamma_time
-        
-        # r^sch = w * R^task - λ * c
-        reward = w_it * R_task - self.config.lambda_tok * c_t
-        
+
+        # r^sch = R^task - λ * c
+        reward = R_task - self.config.lambda_tok * c_t
+
         # Clip
         return max(-self.config.reward_clip, min(self.config.reward_clip, reward))
-    
+
     def compute_batch_rewards(
         self,
         task_rewards: List[float],
-        step_indices: List[int],
-        total_steps: List[int],
         token_counts: List[int],
     ) -> List[float]:
         """Compute rewards for a batch of scheduler steps."""
         rewards = []
-        for R_task, t, T, c in zip(task_rewards, step_indices, total_steps, token_counts):
-            w_it = (t / max(T, 1)) ** self.config.gamma_time
-            r = w_it * R_task - self.config.lambda_tok * c
+        for R_task, c in zip(task_rewards, token_counts):
+            r = R_task - self.config.lambda_tok * c
             r = max(-self.config.reward_clip, min(self.config.reward_clip, r))
             rewards.append(r)
         return rewards
@@ -128,17 +129,18 @@ class SchedulerRewardFunction:
 
 class RouterRewardFunction:
     """
-    Router reward function for verl integration.
-    
-    Formula: r^rou_{i,t} = α * h_{i,t} + η * R^task_i
-    where h_{i,t} = u_{i,t} / k_{i,t} (hit rate)
-    
+    Context Allocator reward function for verl integration.
+
+    Formula (paper Eq. 12): r^rou_{i,t} = α * R_agent + η * R^task_i
+    where R_agent = (1 / |M^context_t|) * Σ_i u_i is the hit rate reported by
+    the active agent after it finished its work (paper Eq. 11).
+
     This is designed to be used with verl's reward function interface.
     """
-    
+
     def __init__(self, config: MASRewardConfig = None):
         self.config = config or MASRewardConfig()
-    
+
     def __call__(
         self,
         data_item: Dict[str, Any],
@@ -147,12 +149,12 @@ class RouterRewardFunction:
     ) -> float:
         """
         Compute reward for a router decision.
-        
+
         Args:
             data_item: The task data
             response: The router's output (selected indices)
             step_info: Additional info (useful_count, routed_count, task_reward, top_n)
-            
+
         Returns:
             Reward value
         """
@@ -161,18 +163,19 @@ class RouterRewardFunction:
         routed_count = step_info.get("routed_count", 1)
         R_task = step_info.get("task_reward", 0.0)
         top_n = step_info.get("top_n", None)  # Maximum allowed memories
-        
-        # Hit rate: h = u / k
+
+        # Hit rate: R_agent = u / |M^context|
         h_it = useful_count / max(routed_count, 1)
-        
-        # r^rou = α * h + η * R^task
+
+        # r^rou = α * R_agent + η * R^task
         reward = self.config.alpha * h_it + self.config.eta * R_task
-        
-        # Penalty for exceeding top_n limit: -0.5 if routed_count > top_n
-        if top_n is not None and routed_count > top_n:
-            reward -= 0.5
+
+        # Non-paper extension, off by default (over_budget_penalty == 0.0).
+        penalty = self.config.over_budget_penalty
+        if penalty > 0.0 and top_n is not None and routed_count > top_n:
+            reward -= penalty
             logger.debug(f"[Router Reward] Penalty applied: routed_count={routed_count} > top_n={top_n}")
-        
+
         # Clip
         return max(-self.config.reward_clip, min(self.config.reward_clip, reward))
     
@@ -834,18 +837,16 @@ class TrainingDataCollector:
     def compute_rewards(self, expert_type: str = "scheduler") -> List[float]:
         """
         Compute rewards for all collected steps of specified type.
-        
+
         Uses the reward functions defined in this module:
-        - Scheduler: r^sch = w_{i,t} * R^task - λ * c_{i,t}
-        - Router: r^rou = α * h_{i,t} + η * R^task
+        - Scheduler: r^sch = R^task - λ * c_{i,t}
+        - Router: r^rou = α * R_agent + η * R^task
         """
         if expert_type == "scheduler":
             data = self.scheduler_data
             return [
                 self.scheduler_reward_fn.compute_batch_rewards(
                     [step.task_reward],
-                    [step.step_idx],
-                    [step.total_steps],
                     [step.token_count],
                 )[0]
                 for step in data

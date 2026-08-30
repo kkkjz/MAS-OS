@@ -1,13 +1,12 @@
 """Reward calculation for Scheduler and Router.
 
-Reward functions:
-- Router: r_rou_{i,t} = α * h_{i,t} + η * R^task_i
-  - h_{i,t} = useful_count / routed_count (hit rate from agent feedback)
+Reward functions (MAS-OS paper Eq. 11-13):
+- Context Allocator: r_rou_{i,t} = α * R_agent + η * R^task_i
+  - R_agent = useful_count / |M^context_t| (hit rate from agent self-report)
   - R^task_i = final task reward from evaluator
 
-- Scheduler: r_sch_{i,t} = w_{i,t} * R^task_i - λ_tok * c_{i,t}
-  - w_{i,t} = (t / T_i)^γ (time-based weight, later steps more important)
-  - c_{i,t} = token consumption at step t
+- Agent Scheduler: r_sch_{i,t} = R^task_i - λ_tok * c_{i,t}
+  - c_{i,t} = token consumption of the activated agent at step t
 """
 from __future__ import annotations
 
@@ -23,22 +22,27 @@ logger = logging.getLogger("MAS")
 
 @dataclass
 class RewardConfig:
-    """Configuration for reward computation."""
-    
-    # Router reward hyperparameters
-    alpha: float = 1.0        # Weight for hit rate h_{i,t}
-    eta: float = 0.5          # Weight for task reward R^task on router
-    
-    # Scheduler reward hyperparameters
-    gamma_time: float = 2.0   # Exponent for time weight w_{i,t} = (t/T)^γ
-    lambda_tok: float = 0.001 # Token cost penalty coefficient
-    
+    """Configuration for reward computation.
+
+    NOTE: this class is NOT the one used during training. The live reward
+    hyperparameters live in `verl_integration.MASRewardConfig`, which the MARTI
+    workflow instantiates. Defaults here are kept in sync with the paper
+    (Appendix A) so the two cannot drift.
+    """
+
+    # Context Allocator reward hyperparameters (Eq. 12)
+    alpha: float = 0.25       # Weight for the agent hit-rate term R_agent
+    eta: float = 1.0          # Weight for the terminal task reward R^task
+
+    # Agent Scheduler reward hyperparameters (Eq. 13)
+    lambda_tok: float = 5e-5  # Per-step token cost penalty
+
     # Discount factor for return calculation
     gamma_discount: float = 1.0  # 1.0 = no discounting (episodic)
-    
+
     # Reward normalization
     normalize_rewards: bool = True
-    reward_clip: float = 10.0  # Clip rewards to [-clip, clip]
+    reward_clip: float = 2.0  # Clip rewards to [-clip, clip]
 
 
 @dataclass
@@ -103,11 +107,10 @@ class EpisodeTrajectory:
 class RewardCalculator:
     """
     Computes rewards for Scheduler and Router based on episode trajectory.
-    
-    Key formulas:
-    - Router: r^rou_{i,t} = α * h_{i,t} + η * R^task_i
-    - Scheduler: r^sch_{i,t} = w_{i,t} * R^task_i - λ_tok * c_{i,t}
-      where w_{i,t} = (t / T_i)^γ
+
+    Key formulas (paper Eq. 12-13):
+    - Context Allocator: r^rou_{i,t} = α * R_agent + η * R^task_i
+    - Agent Scheduler:   r^sch_{i,t} = R^task_i - λ_tok * c_{i,t}
     """
     
     def __init__(self, config: RewardConfig = None):
@@ -136,21 +139,19 @@ class RewardCalculator:
         
         for step in trajectory.steps:
             t = step.step_idx  # 1-indexed
-            
-            # Router reward: r^rou = α * h_{i,t} + η * R^task
+
+            # Context Allocator reward (Eq. 12): r^rou = α * R_agent + η * R^task
             h_it = step.hit_rate
             r_rou = self.config.alpha * h_it + self.config.eta * R_task
             step.router_reward = self._clip_reward(r_rou)
-            
-            # Scheduler reward: r^sch = w_{i,t} * R^task - λ_tok * c_{i,t}
-            # w_{i,t} = (t / T_i)^γ
-            w_it = (t / T_i) ** self.config.gamma_time
+
+            # Agent Scheduler reward (Eq. 13): r^sch = R^task - λ_tok * c_{i,t}
             c_it = step.token_count
-            r_sch = w_it * R_task - self.config.lambda_tok * c_it
+            r_sch = R_task - self.config.lambda_tok * c_it
             step.scheduler_reward = self._clip_reward(r_sch)
-            
+
             logger.debug(
-                f"[Reward] Step {t}: h={h_it:.3f}, w={w_it:.3f}, "
+                f"[Reward] Step {t}: h={h_it:.3f}, "
                 f"r_rou={step.router_reward:.4f}, r_sch={step.scheduler_reward:.4f}"
             )
         
@@ -230,31 +231,25 @@ def compute_task_reward_from_evaluator(
 ) -> float:
     """
     Convert evaluator result to numerical task reward R^task.
-    
+
+    Per the paper (Appendix A), R^task lies in [0, 1]: a binary correctness
+    indicator for the reasoning benchmarks (GSM-hard, SciBench, MMLU-Pro), and
+    the arithmetic mean of the three component scores for SRDD (passed in via
+    `partial_score`).
+
     Args:
         correct: Whether the task was solved correctly
-        task_type: Type of task (affects reward scale)
-        partial_score: Optional partial credit [0, 1]
-        
+        task_type: Type of task (unused; kept for call-site compatibility)
+        partial_score: Optional partial credit already in [0, 1]
+
     Returns:
-        Numerical reward value
+        Numerical reward value in [0, 1]
     """
     if partial_score is not None:
-        # Use partial score directly, scaled to [-1, 1]
-        return 2.0 * partial_score - 1.0
-    
-    # Binary reward based on task type
-    reward_scales = {
-        "MMLU-Pro": 1.0,
-        "GSM-Hard": 1.0,
-        "gsm-hard": 1.0,
-        "SRDD": 1.0,
-        "CW": 0.5,  # Creative writing is harder to evaluate
-        "default": 1.0,
-    }
-    
-    scale = reward_scales.get(task_type, 1.0)
-    return scale if correct else -scale
+        # Already in [0, 1] (e.g. SRDD's mean of completeness/executability/consistency)
+        return max(0.0, min(1.0, float(partial_score)))
+
+    return 1.0 if correct else 0.0
 
 
 class TrajectoryBuffer:

@@ -14,16 +14,20 @@ class MASConfig:
     # Maximum steps before forcing termination
     max_steps: int = 12
     
-    # Memory retrieval parameters
-    top_m: int = 7  # TopM candidates from Memer
-    top_n: int = 3   # TopN actually routed to agent
-    
-    # Semantic similarity threshold for memory edges
+    # Memory retrieval parameters (paper Appendix A: M=7, K=3)
+    top_m: int = 7  # M: candidate memory pool size from Memer
+    top_n: int = 3   # K: context budget actually allocated to the agent
+
+    # Semantic edge threshold τ for embedding cosine similarity (paper: τ = 0.80)
     similarity_threshold: float = 0.8
+    # Separate, much looser threshold for the keyword-overlap (Jaccard) fallback
+    # used when no embedding model is available. Reusing τ = 0.80 here would be
+    # unreachable for word sets, silently producing zero semantic edges.
+    fallback_overlap_threshold: float = 0.30
     embedding_model: str = "BAAI/bge-m3"
     embedding_device: Optional[str] = None
-    # Disable embedding-based semantic edges and retrieval (fallback to keyword overlap).
-    # Set True only if you have sentence-transformers installed and want semantic linking.
+    # Embedding-based semantic edges. Required for the paper's memory graph;
+    # turning this off degrades semantic edges to keyword overlap.
     use_embeddings: bool = True
     
     # LLM settings
@@ -32,10 +36,24 @@ class MASConfig:
     llm_model: str = ""
     llm_temperature: float = 0.0
     
-    # Whether to use LLM for scheduling (False = rule-based fallback)
-    use_llm_scheduler: bool = False
-    use_llm_router: bool = False
-    use_llm_memer: bool = False
+    # Whether to use the LLM policies for the OS kernel components.
+    # The paper's Scheduler (pi_theta), Context Allocator (pi_phi) and Memory
+    # Manager are all LLM-driven, so these default to True. Setting any to False
+    # swaps in a rule-based fallback (keyword matching / string concatenation),
+    # which is a degraded mode, NOT the paper's method.
+    use_llm_scheduler: bool = True
+    use_llm_router: bool = True
+    use_llm_memer: bool = True
+
+    # --- Non-paper extensions. All default to the paper-faithful setting. ---
+    # Inject MMLU-Pro-specific answer-format instructions into worker agents'
+    # role prompts. Not described in the paper; enable only to reproduce the
+    # originally reported MMLU-Pro numbers.
+    enable_mmlu_prompt_injection: bool = False
+    # Bypass the learned allocation policy pi_phi with hand-written rules for
+    # planner/terminator agents. Not described in the paper, and it removes
+    # those steps from the RL gradient. Enable only to reproduce old numbers.
+    enable_role_based_routing: bool = False
     
     # Logging
     log_level: str = "INFO"
@@ -87,22 +105,27 @@ class DualLoRAConfig:
 
 @dataclass
 class RewardConfig:
-    """Configuration for reward computation."""
-    
-    # Router reward: r_rou = α * h_{i,t} + η * R^task
-    alpha: float = 1.0        # Weight for hit rate
-    eta: float = 0.5          # Weight for task reward on router
-    
-    # Scheduler reward: r_sch = w_{i,t} * R^task - λ_tok * c_{i,t}
-    gamma_time: float = 2.0   # Exponent for time weight w = (t/T)^γ
-    lambda_tok: float = 0.001 # Token cost penalty
-    
+    """Configuration for reward computation.
+
+    NOTE: this class is NOT the one used during training. The live reward
+    hyperparameters live in `verl_integration.MASRewardConfig`, which the MARTI
+    workflow instantiates. Defaults here are kept in sync with the paper
+    (Appendix A) so the two cannot drift.
+    """
+
+    # Context Allocator reward (Eq. 12): R_context = α * R_agent + η * R_task
+    alpha: float = 0.25       # Weight for the agent hit-rate term
+    eta: float = 1.0          # Weight for the terminal task reward
+
+    # Agent Scheduler reward (Eq. 13): R_scheduler = R_task - λ * c_t
+    lambda_tok: float = 5e-5  # Per-step token cost penalty
+
     # Return calculation
     gamma_discount: float = 1.0  # Discount factor (1.0 = no discounting)
-    
+
     # Normalization
     normalize_rewards: bool = True
-    reward_clip: float = 10.0
+    reward_clip: float = 2.0
 
 
 @dataclass

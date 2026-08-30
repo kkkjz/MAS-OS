@@ -67,6 +67,7 @@ from .verl_integration import (
 from .agent_feedback import (
     AgentFeedbackCollector,
     MemoryUsefulnessFeedback,
+    extract_agent_output_text,
     generate_memory_feedback_prompt,
     parse_memory_feedback_response,
     run_agent_with_parallel_feedback,
@@ -135,9 +136,10 @@ __all__ = [
     "generate_verl_training_script",
     "compute_task_reward",
     
-    # Agent feedback for router reward
+    # Agent feedback for context allocator reward
     "AgentFeedbackCollector",
     "MemoryUsefulnessFeedback",
+    "extract_agent_output_text",
     "generate_memory_feedback_prompt",
     "parse_memory_feedback_response",
     "run_agent_with_parallel_feedback",

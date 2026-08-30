@@ -1,22 +1,24 @@
-"""Agent Feedback Module for Router Reward Computation.
+"""Agent Feedback Module for Context Allocator Reward Computation.
 
 This module enables work agents to provide explicit feedback on the usefulness
-of routed memories. This feedback is used to compute the hit rate h_{i,t} for
-the Router reward function:
+of routed memories. This feedback is used to compute the hit rate R_agent for
+the Context Allocator reward function:
 
-    r^rou_{i,t} = α * h_{i,t} + η * R^task_i
-    
-where h_{i,t} = u_{i,t} / k_{i,t}
-- u_{i,t}: Number of memories marked useful by agent (from agent feedback)
-- k_{i,t}: Number of memories routed to agent
+    r^rou_{i,t} = α * R_agent + η * R^task_i
 
-This replaces the heuristic estimation with actual agent self-feedback.
+where R_agent = u_{i,t} / |M^context_t| (paper Eq. 11)
+- u_{i,t}: Number of memories the agent actually used
+- |M^context_t|: Number of memories routed to the agent
 
-Training Mode:
-- 并行发起两个 API 请求：
-  1. 正常工作请求：agent 执行任务输出结论
-  2. 反馈请求：相同输入，专门输出"哪些记忆有用"
-- 两者并行执行，不增加延迟
+Paper semantics (Eq. 11): the active agent returns u_i **after completing its
+work**, so the judgement is made in retrospect, with the agent's output in hand.
+
+Collection mode:
+- `collect_feedback_posthoc` — the paper-faithful path. Runs serially AFTER the
+  agent finishes and is given the agent's actual output.
+- `collect_feedback_parallel` / `run_agent_with_parallel_feedback` — deprecated.
+  These fire concurrently with the agent and therefore cannot see its output,
+  making u_i a prior prediction rather than a post-hoc report.
 """
 from __future__ import annotations
 
@@ -56,6 +58,51 @@ class MemoryUsefulnessFeedback:
         if self.routed_count <= 0:
             return 0.0
         return min(1.0, self.useful_count / self.routed_count)
+
+
+def extract_agent_output_text(action: Any) -> str:
+    """Render a worker agent's action into the text shown to the post-hoc judge.
+
+    Accepts a puppeteer `Action` (see puppeteer/agent/agent_info/workflow.py) or
+    anything dict-like. Prefers the action's own `to_str()`, then falls back to
+    the informative fields of `to_dict()`, then to `str()`.
+    """
+    if action is None:
+        return ""
+
+    # puppeteer Action exposes to_str() -> "Agent: .. Action: .. Result: .."
+    to_str = getattr(action, "to_str", None)
+    if callable(to_str):
+        try:
+            text = to_str()
+            if text:
+                return str(text)
+        except Exception:  # pragma: no cover - defensive
+            pass
+
+    to_dict = getattr(action, "to_dict", None)
+    if callable(to_dict):
+        try:
+            payload = to_dict()
+        except Exception:  # pragma: no cover - defensive
+            payload = None
+        if isinstance(payload, dict):
+            parts = []
+            result = payload.get("result")
+            if isinstance(result, dict):
+                for key in ("step_data", "answer", "code"):
+                    value = result.get(key)
+                    if value:
+                        parts.append(f"{key}: {value}")
+            elif result:
+                parts.append(f"result: {result}")
+            act = payload.get("action")
+            if act:
+                parts.append(f"action: {act}")
+            if parts:
+                return "\n".join(parts)
+
+    return str(action)
 
 
 def generate_memory_feedback_prompt(routed_memories: List[Dict]) -> str:
@@ -298,6 +345,108 @@ class AgentFeedbackCollector:
         self._current_step_memories = []
         self._step_feedbacks = {}
 
+    def collect_feedback_posthoc(
+        self,
+        agent_name: str,
+        step_idx: int,
+        question: str,
+        agent_output: str,
+        task_context: str = "",
+    ) -> MemoryUsefulnessFeedback:
+        """
+        事后自评（论文 Eq. 11）：active agent 完成工作后，判断每条被分配的记忆是否
+        真的被用上了，返回 u_i ∈ {0, 1}。
+
+        与已废弃的 collect_feedback_parallel 的关键区别：本方法**在 agent 执行结束
+        之后**串行调用，并把 agent 的实际输出喂给判定器。并行版本按构造看不到 agent
+        的输出，其 u_i 实际是"这些记忆看起来有没有用"的事前预测，而非论文要求的事后
+        回报。
+
+        Args:
+            agent_name: 当前工作 agent 名称
+            step_idx: 当前步骤索引
+            question: 原始问题
+            agent_output: agent 本步的实际输出（判定的核心依据）
+            task_context: 任务上下文（全局摘要）
+
+        Returns:
+            MemoryUsefulnessFeedback with useful_count
+        """
+        if not self._current_step_memories:
+            return MemoryUsefulnessFeedback()
+
+        routed_count = len(self._current_step_memories)
+
+        if self._llm is None:
+            logger.warning("[AgentFeedback] No LLM client for post-hoc feedback")
+            return MemoryUsefulnessFeedback(
+                routed_count=routed_count,
+                useful_count=0,
+            )
+
+        # 构建记忆列表
+        memory_list = []
+        for idx, mem in enumerate(self._current_step_memories):
+            source = mem.get("node_type", mem.get("source", "unknown"))
+            summary = mem.get("summary", "")[:200]
+            memory_list.append(f"[{idx}] ({source}): {summary}")
+
+        memories_text = "\n".join(memory_list)
+        output_text = str(agent_output)[:1500] if agent_output else "(empty output)"
+
+        system_prompt = f"""You are auditing which memories agent "{agent_name}" ACTUALLY USED.
+
+The agent has already FINISHED its work. You are shown the {routed_count} memories it was given and the output it produced. Decide, in retrospect, which memories were actually used or relied upon to produce that output.
+
+Criteria for "actually used":
+- The output reuses information, facts, or intermediate results from the memory
+- The output builds on, corrects, or explicitly references the memory
+- Do NOT mark a memory useful merely because it looks topically related
+
+Output ONLY in this format: USEFUL_MEMORIES: <comma-separated indices or "none">
+Examples:
+- USEFUL_MEMORIES: 0, 2
+- USEFUL_MEMORIES: 1
+- USEFUL_MEMORIES: none"""
+
+        user_prompt = f"""Task Question: {question}
+
+Global progress before this step: {task_context[:500] if task_context else "No prior context"}
+
+Memories given to {agent_name}:
+{memories_text}
+
+Output that {agent_name} actually produced:
+{output_text}
+
+Which of those memories were actually used to produce this output?
+Reply with USEFUL_MEMORIES: <indices or none>"""
+
+        try:
+            response = self._llm.chat(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=0.0,
+            )
+
+            feedback = parse_memory_feedback_response(response, routed_count)
+
+            # Store feedback
+            step_key = f"{agent_name}_{step_idx}"
+            self._step_feedbacks[step_key] = feedback
+
+            logger.info(
+                f"[AgentFeedback] Post-hoc feedback: {feedback.useful_count}/{routed_count} useful"
+            )
+            return feedback
+
+        except Exception as e:
+            logger.error(f"[AgentFeedback] Post-hoc feedback error: {e}")
+            return MemoryUsefulnessFeedback(
+                routed_count=routed_count,
+                useful_count=0,
+            )
+
     def collect_feedback_parallel(
         self,
         agent_name: str,
@@ -306,18 +455,20 @@ class AgentFeedbackCollector:
         question: str,
     ) -> MemoryUsefulnessFeedback:
         """
-        并行反馈收集：发起独立的 API 请求专门获取记忆有用性反馈。
-        
-        这个方法设计为与正常 agent 执行并行调用：
-        - 正常请求：agent.take_action() 执行任务
-        - 反馈请求：本方法，专门判断哪些记忆有用
-        
+        并行反馈收集（**已废弃，与论文 Eq. 11 不符**）。
+
+        本方法设计为与 agent 执行并行调用，因此按构造看不到 agent 的输出，判定的是
+        "这些记忆看起来有没有用"（事前预测），而论文要求的是 active agent 完成工作
+        **之后**返回的 u_i（事后回报）。请改用 collect_feedback_posthoc。
+
+        保留仅为向后兼容。
+
         Args:
             agent_name: 当前工作 agent 名称
             step_idx: 当前步骤索引
             task_context: 任务上下文（问题 + 历史摘要）
             question: 原始问题
-            
+
         Returns:
             MemoryUsefulnessFeedback with useful_count
         """
@@ -398,16 +549,21 @@ def run_agent_with_parallel_feedback(
 ) -> Tuple[Any, MemoryUsefulnessFeedback]:
     """
     并行执行 agent 工作和反馈收集。
-    
-    这是训练时的核心函数：同时发起两个请求，等待两者完成。
+
+    **已废弃，与论文 Eq. 11 不符。** 反馈请求与 agent 并发发出，因此看不到 agent 的
+    输出，得到的是事前预测而非事后回报。正确做法：先执行 agent，再调用
+    AgentFeedbackCollector.collect_feedback_posthoc(agent_output=...)。
+
+    保留仅为向后兼容。
+
     - agent_action_fn: 正常的 agent 执行函数（返回 action, terminated）
     - feedback_fn: 反馈收集函数（返回 MemoryUsefulnessFeedback）
-    
+
     Args:
         agent_action_fn: 无参函数，执行 agent.take_action()，返回 (action, terminated)
         feedback_fn: 无参函数，执行反馈收集，返回 MemoryUsefulnessFeedback
         timeout: 超时时间（秒）
-        
+
     Returns:
         (agent_result, feedback) 其中 agent_result = (action, terminated)
     """

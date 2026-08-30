@@ -27,16 +27,15 @@ from typing import Any, Dict, List, Optional
 from .config import MASConfig, DEFAULT_MAS_CONFIG
 from .llm import MASLLMClient
 from .memer import Memer
-from .scheduler import MASScheduler, AgentRegistry, AgentSpec
-from .router import MASRouter
+from .scheduler import MASScheduler, AgentRegistry, AgentSpec, build_scheduler_prompt
+from .router import MASRouter, build_router_prompt, format_memory_candidates
 from .task_state import MASTaskState, AgentResult
-from .dual_lora_model import format_scheduler_prompt, format_router_prompt
 from .agent_feedback import (
     AgentFeedbackCollector,
     MemoryUsefulnessFeedback,
+    extract_agent_output_text,
     generate_memory_feedback_prompt,
     parse_memory_feedback_response,
-    run_agent_with_parallel_feedback,
 )
 
 logger = logging.getLogger("MAS")
@@ -55,13 +54,13 @@ class MASReasoning:
     1. Scheduler chooses next agent based on sum_memory
     2. Router selects TopN memories from TopM candidates
     3. Agent executes with routed memories as context
-    4. Agent provides self-feedback on memory usefulness
+    4. Agent self-reports memory usefulness AFTER finishing (paper Eq. 11)
     5. Memer ingests output, updates summaries
     6. Repeat until termination
-    
+
     Extended for RL training:
     - Collects (prompt, response, step_info) for GRPO training
-    - Agent self-feedback provides useful_count for router reward
+    - Agent post-hoc self-feedback provides useful_count for allocator reward
     - Precise token counting for scheduler reward
     """
     
@@ -208,7 +207,9 @@ class MASReasoning:
         scheduler_desc = self.scheduler.describe_agents()
         scheduler_view = self.task_state.to_scheduler_view(scheduler_desc)
 
-        # Construct scheduler prompt for training (approximate to actual decision context)
+        # Construct scheduler prompt for training. Uses the SAME builder that
+        # MASScheduler._llm_choose sends to the policy, so the recorded prompt is
+        # exactly the one that produced the action (required for on-policy RL).
         try:
             question = self.task.get("Question", self.task.get("question", ""))
             agent_specs_prompt = ""
@@ -217,12 +218,14 @@ class MASReasoning:
             else:
                 # fallback: join agent specs from registry
                 agent_specs_prompt = self._registry.to_prompt()
-            scheduler_prompt_text = format_scheduler_prompt(
+            sch_sys, sch_user = build_scheduler_prompt(
                 question=question,
+                agent_specs_prompt=agent_specs_prompt,
                 sum_memory=self.task_state.sum_memory,
-                agent_specs=agent_specs_prompt,
                 pre_agent=self.task_state.pre_agent,
+                pre_mem=self.task_state.pre_mem,
             )
+            scheduler_prompt_text = f"{sch_sys}\n\n{sch_user}"
         except Exception as e:
             logger.debug(f"[MASReasoning] Failed to format scheduler prompt: {e}")
             scheduler_prompt_text = ""
@@ -270,28 +273,41 @@ class MASReasoning:
         self._current_routed_memories = routed_memories
         self.feedback_collector.set_routed_memories(routed_memories)
         
-        # Build router prompt string for training record
+        # Build router prompt string for training record. Uses the SAME builder
+        # and the SAME candidate list (topm_nodes = M^candidate_t) that the
+        # allocator policy saw. Recording the post-selection `routed_memories`
+        # here would leak the answer into the prompt.
         try:
-            candidates_text = "\n".join(
-                [
-                    f"[{idx}] ({mem.get('node_type', 'unknown')}): {mem.get('summary', '')}"
-                    for idx, mem in enumerate(routed_memories)
-                ]
-            )
-            router_prompt_text = format_router_prompt(
-                question=self.task.get("Question", self.task.get("question", "")),
-                now_agent=agent_name,
-                sum_memory=self.task_state.sum_memory,
-                candidates=candidates_text,
-                pre_agent=self.task_state.pre_agent,
+            router_prompt_text = "{}\n\n{}".format(
+                *build_router_prompt(
+                    question=self.task.get("Question", self.task.get("question", "")),
+                    now_agent=agent_name,
+                    sum_memory=self.task_state.sum_memory,
+                    candidates=format_memory_candidates(topm_nodes),
+                    pre_agent=self.task_state.pre_agent,
+                    pre_mem=self.task_state.pre_mem,
+                    top_n=self.config.top_n,
+                    agent_description=agent_description,
+                )
             )
         except Exception as e:
             logger.debug(f"[MASReasoning] Failed to format router prompt: {e}")
             router_prompt_text = ""
 
+        # Recover which candidate indices the allocator actually selected, so the
+        # recorded action matches the recorded prompt's indexing.
+        selected_indices: List[int] = []
+        for mem in routed_memories:
+            for idx, node in enumerate(topm_nodes):
+                if idx in selected_indices:
+                    continue
+                if node.node_type == mem.get("node_type") and node.summary == mem.get("summary"):
+                    selected_indices.append(idx)
+                    break
+
         # Record router decision
         self.task_state.record_router_decision(
-            action=list(range(routed_count)),
+            action=selected_indices,
             log_prob=0.0,
             prompt=router_prompt_text,
             routed_count=routed_count,
@@ -307,49 +323,30 @@ class MASReasoning:
         # Activate agent
         agent.activate(self.global_info, initial_dialog_history=agent.initial_dialog_history)
         
-        # 4. 并行执行：正常 agent 工作 + 反馈收集
-        # 训练模式下同时发起两个 API 请求，不增加延迟
+        # 4. 执行 agent，然后事后收集记忆有用性反馈（论文 Eq. 11）
         question = self.task.get('Question', self.task.get('question', ''))
-        
+
         # 检查是否需要收集 feedback（评测时可关闭）
         should_collect_feedback = getattr(self.config, 'collect_feedback', True)
-        
+
+        current_action, terminated = agent.take_action(
+            self.global_info,
+            external_tools_enabled=True,
+        )
+
         if self.enable_training_data_collection and routed_count > 0 and should_collect_feedback:
-            # 定义并行任务
-            def agent_action_fn():
-                return agent.take_action(
-                    self.global_info,
-                    external_tools_enabled=True,
-                )
-            
-            def feedback_fn():
-                return self.feedback_collector.collect_feedback_parallel(
-                    agent_name=agent_name,
-                    step_idx=self.task_state.steps + 1,
-                    task_context=self.task_state.sum_memory,
-                    question=question,
-                )
-            
-            # 并行执行
-            (current_action, terminated), feedback_result = run_agent_with_parallel_feedback(
-                agent_action_fn=agent_action_fn,
-                feedback_fn=feedback_fn,
-                timeout=120.0,
+            # 论文 Eq. 11：active agent 完成工作**之后**，对每条被分配的记忆返回 u_i。
+            # 判定器必须看到 agent 的实际输出，因此这一步只能串行。
+            feedback_result = self.feedback_collector.collect_feedback_posthoc(
+                agent_name=agent_name,
+                step_idx=self.task_state.steps + 1,
+                question=question,
+                agent_output=extract_agent_output_text(current_action),
+                task_context=self.task_state.sum_memory,
             )
-            
-            # 如果 agent 执行失败，使用默认值
-            if current_action is None:
-                logger.error(f"[MASReasoning] Agent {agent_name} execution failed")
-                return True
-            
             useful_count = feedback_result.useful_count
-            logger.info(f"[MASReasoning] Parallel feedback: {useful_count}/{routed_count} memories useful")
+            logger.info(f"[MASReasoning] Post-hoc feedback: {useful_count}/{routed_count} memories useful")
         else:
-            # 非训练模式或无路由记忆：正常执行
-            current_action, terminated = agent.take_action(
-                self.global_info,
-                external_tools_enabled=True,
-            )
             useful_count = 0
         
         # 5. Extract token count from agent action
@@ -413,15 +410,20 @@ class MASReasoning:
     ) -> int:
         """
         Collect agent's self-feedback on memory usefulness.
-        
-        This provides the u_{i,t} value for router reward computation:
-        h_{i,t} = u_{i,t} / k_{i,t}
-        
+
+        NOTE: currently unused. `_step` calls
+        AgentFeedbackCollector.collect_feedback_posthoc directly, which is the
+        paper-faithful path (Eq. 11). Kept for the case where the worker agent
+        itself emits a USEFUL_MEMORIES line in its response.
+
+        This provides the u_{i,t} value for the allocator reward:
+        R_agent = u_{i,t} / |M^context_t|
+
         Strategy:
         1. Try to parse feedback from agent's response (if it included USEFUL_MEMORIES)
         2. If no explicit feedback, use LLM to evaluate based on agent output
         3. Fallback to heuristic if both fail
-        
+
         Returns:
             Number of memories the agent found useful
         """
@@ -554,16 +556,22 @@ class MASReasoning:
     def _enhance_agent_prompt_for_mmlu(self, agent, agent_name: str) -> None:
         """
         针对 MMLU-Pro 任务，为特定 agent 增强提示词。
-        
+
+        **论文未描述此机制，默认关闭**（config.enable_mmlu_prompt_injection=False）。
+        仅在需要复现原先报告的 MMLU-Pro 数字时开启。
+
         对于选择题任务，需要强调：
         1. 只输出选项字母（A-J）
         2. 不要输出数字、金额或其他格式
         3. 确保最终答案是单个大写字母
-        
+
         Args:
             agent: 要增强的 agent 实例
             agent_name: agent 名称
         """
+        if not getattr(self.config, "enable_mmlu_prompt_injection", False):
+            return
+
         task_type = self.task.get("type", "").lower()
         
         # 只对 MMLU-Pro 任务进行增强

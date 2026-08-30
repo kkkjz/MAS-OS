@@ -1,10 +1,12 @@
-"""Memer: Memory manager for MAS-style scheduling.
+"""Memer: Memory Manager for MAS-OS.
 
 Memer is responsible for:
-1. Receiving agent outputs and converting them to memory nodes
-2. Building a graph memory with temporal and semantic edges
-3. Generating summaries (per-step and global)
-4. Providing TopM candidates for Router to select from
+1. Receiving agent outputs and converting them to memory nodes (o_t, s_t)
+2. Building the memory graph G_t = (V_t, E^T_t, E^S_t) with temporal and
+   τ-thresholded semantic edges
+3. Maintaining the rolling global summary M^global_t
+4. Building the candidate pool M^candidate_t (capacity M) for the Context
+   Allocator by traversing the graph backward from v_{t-1}
 """
 from __future__ import annotations
 
@@ -45,12 +47,12 @@ class MemoryNode:
 
 
 class Memer:
-    """Memory manager that maintains shared graph memory.
-    
+    """Memory manager that maintains the shared memory graph.
+
     Key responsibilities:
-    1. ingest(): Convert agent output to MemoryNode with semantic summary
-    2. retrieve(): Return TopM candidate nodes for Router
-    3. provide_summary(): Generate global progress summary for Scheduler
+    1. ingest(): Convert agent output to a MemoryNode with a semantic summary
+    2. retrieve(): Build the candidate pool M^candidate_t for the allocator
+    3. provide_summary(): Expose the rolling global summary for the Scheduler
     """
     
     def __init__(
@@ -139,34 +141,69 @@ class Memer:
         return node
     
     def retrieve(self, query: str = "", top_m: Optional[int] = None) -> List[MemoryNode]:
-        """Retrieve TopM candidate nodes for Router.
-        
-        Strategy (interleaved temporal + 1-hop semantic):
-        - Start from most recent node (last step)
-        - For每个时间节点，先取该节点，再取其 1-hop 语义邻居
-        - 继续向更早的时间节点，直到填满 TopM
+        """Build the candidate memory pool M^candidate_t for the Context Allocator.
+
+        Implements the paper's traversal (§3.2.3): starting from the memory node
+        at step t-1, walk BACKWARD along both temporal and semantic edges,
+        collecting at each step the current node plus its 1-hop neighbours, until
+        the candidate set reaches the capacity M (|M^candidate_t| <= M).
+
+        Realised as a breadth-first walk over the memory graph: the frontier is
+        seeded with v_{t-1}; each dequeued node contributes itself and its 1-hop
+        neighbours (semantic neighbours + temporal predecessor), and those
+        neighbours are enqueued so the walk keeps moving backward through the
+        graph. If the graph is disconnected, the walk falls back to plain
+        reverse-chronological order so the pool is still filled up to M.
         """
         if not self._nodes:
             return []
-        
-        limit = top_m or self.config.top_m
+
+        limit = top_m if top_m is not None else self.config.top_m
+        if limit <= 0:
+            return []
+
         payload: List[MemoryNode] = []
         seen: set[str] = set()
-        
-        for nid in reversed(self._node_order):
-            if len(payload) >= limit:
-                break
-            self._add_node_to_payload(nid, payload, seen, limit)
-            
-            # Interleave 1-hop semantic neighbors of this node
-            node = self._nodes[nid]
-            for nb_id in node.semantic_neighbors:
+
+        # Seed with the most recent node, i.e. the node produced at step t-1.
+        frontier: List[str] = [self._node_order[-1]]
+        expanded: set[str] = set()
+
+        while frontier and len(payload) < limit:
+            node_id = frontier.pop(0)
+            if node_id in expanded:
+                continue
+            expanded.add(node_id)
+
+            node = self._nodes.get(node_id)
+            if node is None:
+                continue
+
+            # Collect the node itself...
+            self._add_node_to_payload(node_id, payload, seen, limit)
+
+            # ...then its 1-hop neighbours along both edge types.
+            neighbors = list(node.semantic_neighbors)
+            if node.temporal_prev:
+                neighbors.append(node.temporal_prev)
+
+            for nb_id in neighbors:
+                if nb_id not in self._nodes:
+                    continue
+                self._add_node_to_payload(nb_id, payload, seen, limit)
+                if nb_id not in expanded:
+                    frontier.append(nb_id)
+
+        # The graph may be disconnected (e.g. no semantic edges and a missing
+        # temporal link). Top up from the remaining history, most recent first,
+        # so the allocator still sees up to M candidates.
+        if len(payload) < limit:
+            for node_id in reversed(self._node_order):
                 if len(payload) >= limit:
                     break
-                self._add_node_to_payload(nb_id, payload, seen, limit)
-        
-        return payload
-    
+                self._add_node_to_payload(node_id, payload, seen, limit)
+
+        return payload[:limit]
     def provide_summary(self) -> str:
         """Provide the current global progress summary."""
         return self._global_summary
@@ -179,7 +216,7 @@ class Memer:
         - Describe what the agent did and key output
         - Concise and focused
         """
-        if self._llm is None or not self.config.use_llm_memer:
+        if not self.config.use_llm_memer or not getattr(self._llm, "is_available", False):
             return self._fallback_summary(result)
         
         try:
@@ -263,12 +300,18 @@ One-sentence summary of what {result.name} did:"""
     def _get_embedder(self):
         """Lazy-load embedding model."""
         if not getattr(self.config, "use_embeddings", False):
-            # Explicitly disable embeddings (always use keyword-overlap fallback).
+            # Explicitly disabled: semantic edges fall back to keyword overlap.
             return None
         if self._embedder is not None:
             return self._embedder
         if SentenceTransformer is None:
-            logger.warning("SentenceTransformer not available; using fallback keyword overlap")
+            logger.error(
+                "use_embeddings=True but sentence-transformers is not installed. "
+                "Semantic edges will degrade to keyword overlap, which does NOT "
+                "match the paper's memory graph (τ-thresholded cosine similarity). "
+                "Install sentence-transformers, or set use_embeddings=False to "
+                "acknowledge the degraded mode."
+            )
             return None
         try:
             self._embedder = SentenceTransformer(
@@ -277,7 +320,11 @@ One-sentence summary of what {result.name} did:"""
             )
             logger.info(f"[Memer] Loaded embedding model: {self.config.embedding_model}")
         except Exception as e:  # pragma: no cover - external dependency
-            logger.warning(f"Failed to load embedding model: {e}; fallback to keywords")
+            logger.error(
+                f"Failed to load embedding model {self.config.embedding_model}: {e}. "
+                "Semantic edges will degrade to keyword overlap, which does NOT "
+                "match the paper's memory graph."
+            )
             self._embedder = None
         return self._embedder
 
@@ -290,44 +337,58 @@ One-sentence summary of what {result.name} did:"""
             vec = embedder.encode(text, normalize_embeddings=True)
             return np.asarray(vec, dtype=np.float32)
         except Exception as e:  # pragma: no cover - external dependency
-            logger.warning(f"Embedding encode failed: {e}; fallback to keywords")
+            logger.error(f"Embedding encode failed: {e}; falling back to keyword overlap")
             return None
-    
+
     def _find_semantic_neighbors(self, node: MemoryNode) -> List[str]:
-        """Find semantically similar nodes via embedding cosine; fallback to keyword overlap."""
+        """Find semantically similar nodes via embedding cosine; fallback to keyword overlap.
+
+        Implements the paper's E^S_t rule: an edge is added between v_t and a
+        previous node v_i iff sim(s_i, s_t) >= τ, for i < t.
+
+        The `i < t` constraint holds implicitly: this is called from `ingest()`
+        BEFORE the new node is inserted into `self._nodes`, so only earlier nodes
+        are visible here. Do not move the call after insertion.
+        """
         if node.embedding is None:
             return self._fallback_semantic_neighbors(node)
-        
+
         neighbors = []
         node_vec = np.array(node.embedding)
-        
+
         for nid, other in self._nodes.items():
             if nid == node.node_id or other.embedding is None:
                 continue
-            
+
             other_vec = np.array(other.embedding)
             # Embeddings are normalized; dot product = cosine similarity
             sim = float(np.dot(node_vec, other_vec))
             if sim >= self.config.similarity_threshold:
                 neighbors.append(nid)
-        
+
         return neighbors
 
     def _fallback_semantic_neighbors(self, node: MemoryNode) -> List[str]:
-        """Fallback: keyword overlap when embeddings are unavailable."""
+        """Fallback: keyword overlap when embeddings are unavailable.
+
+        Uses `fallback_overlap_threshold`, NOT the embedding threshold τ. Jaccard
+        overlap between two word sets rarely exceeds ~0.4 even for near-duplicate
+        text, so applying τ = 0.80 here would yield no semantic edges at all.
+        """
         neighbors = []
         node_words = set(node.summary.lower().split())
-        
+        threshold = getattr(self.config, "fallback_overlap_threshold", 0.30)
+
         for nid, other in self._nodes.items():
             if nid == node.node_id:
                 continue
-            
+
             other_words = set(other.summary.lower().split())
             overlap = len(node_words & other_words) / max(len(node_words | other_words), 1)
-            
-            if overlap >= self.config.similarity_threshold:
+
+            if overlap >= threshold:
                 neighbors.append(nid)
-        
+
         return neighbors
 
     def _add_node_to_payload(
@@ -355,7 +416,7 @@ One-sentence summary of what {result.name} did:"""
         
         This avoids re-summarizing all history and keeps context rolling forward.
         """
-        if self._llm is None or not self.config.use_llm_memer:
+        if not self.config.use_llm_memer or not getattr(self._llm, "is_available", False):
             self._global_summary = self._fallback_global_summary()
             return
         

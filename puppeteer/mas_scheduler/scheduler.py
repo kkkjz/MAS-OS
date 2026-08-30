@@ -60,6 +60,67 @@ class AgentRegistry:
         return self._specs.copy()
 
 
+def build_scheduler_prompt(
+    question: str,
+    agent_specs_prompt: str,
+    sum_memory: str,
+    pre_agent: Optional[str] = None,
+    pre_mem: str = "",
+) -> tuple[str, str]:
+    """Build the Agent Scheduler prompt as a (system, user) pair.
+
+    This is the single source of truth for the scheduler prompt: it is both what
+    `MASScheduler._llm_choose` sends to the policy and what callers record as the
+    training prompt. Keeping one builder prevents the recorded prompt from
+    drifting away from the prompt that actually produced the action.
+
+    Observation follows paper Eq. 7:
+        o^sch_t = [x, M^global_{t-1}, s_{t-1}, a_{sigma_{t-1}}, A]
+    """
+    system_prompt = f"""You are a scheduler for a multi-agent reasoning system.
+
+AVAILABLE AGENTS:
+{agent_specs_prompt}
+
+YOUR TASK:
+Read the task progress description and decide which agent should work next.
+
+DECISION GUIDELINES:
+- If no work has been done → start with a planning/reasoning agent
+- If there's a plan but no execution → choose an execution agent (tool, search, code)
+- If execution produced results → choose a reasoning agent to analyze
+- If analysis suggests problems → choose appropriate agent to fix
+- If reasoning concluded with answer → choose TerminatorAgent to finalize
+- If task is clearly complete → return DONE
+
+CRITICAL:
+- Read the progress description carefully
+- Understand the semantic meaning, not just keywords
+- Consider what's been accomplished vs what's still needed
+- DO NOT select the same agent consecutively (avoid repeating PREVIOUS AGENT)
+- Vary agent selection to make progress; repetition wastes steps
+
+Reply with EXACTLY one word: one of the agent names, or DONE"""
+
+    progress_text = sum_memory if sum_memory else "Task just started. No agents have worked yet."
+
+    # Include pre_mem (last step's memory summary s_{t-1}) for better context
+    last_step_info = ""
+    if pre_agent and pre_mem:
+        last_step_info = f"\nLAST STEP OUTPUT ({pre_agent}): {pre_mem[:300]}"
+
+    user_prompt = f"""QUESTION: {question}
+
+PREVIOUS AGENT: {pre_agent if pre_agent else 'None (first step)'}{last_step_info}
+
+CURRENT PROGRESS:
+{progress_text}
+
+Which agent should work next? Reply with one word only."""
+
+    return system_prompt, user_prompt
+
+
 class MASScheduler:
     """
     Scheduler that dynamically selects the next agent via LLM.
@@ -114,8 +175,8 @@ class MASScheduler:
         logger.debug(f"[Scheduler] pre_mem: {pre_mem[:200] if pre_mem else 'Empty'}")
         logger.debug(f"[Scheduler] sum_memory: {sum_memory[:300] if sum_memory else 'Empty'}")
         
-        # Try LLM-based decision
-        if self._llm is not None and self.config.use_llm_scheduler:
+        # Try LLM-based decision (the paper's policy pi_theta)
+        if self.config.use_llm_scheduler and getattr(self._llm, "is_available", False):
             chosen = self._llm_choose(question, sum_memory, agent_names, pre_agent, pre_mem)
             if chosen is not None:
                 logger.info(f"[Scheduler] LLM chose: {chosen}")
@@ -136,48 +197,13 @@ class MASScheduler:
     ) -> Optional[str]:
         """Use LLM to decide the next agent."""
         try:
-            agent_list = self.registry.to_prompt()
-            
-            system_prompt = f"""You are a scheduler for a multi-agent reasoning system.
-
-AVAILABLE AGENTS:
-{agent_list}
-
-YOUR TASK:
-Read the task progress description and decide which agent should work next.
-
-DECISION GUIDELINES:
-- If no work has been done → start with a planning/reasoning agent
-- If there's a plan but no execution → choose an execution agent (tool, search, code)
-- If execution produced results → choose a reasoning agent to analyze
-- If analysis suggests problems → choose appropriate agent to fix
-- If reasoning concluded with answer → choose TerminatorAgent to finalize
-- If task is clearly complete → return DONE
-
-CRITICAL: 
-- Read the progress description carefully
-- Understand the semantic meaning, not just keywords
-- Consider what's been accomplished vs what's still needed
-- DO NOT select the same agent consecutively (avoid repeating PREVIOUS AGENT)
-- Vary agent selection to make progress; repetition wastes steps
-
-Reply with EXACTLY one word: one of the agent names, or DONE"""
-
-            progress_text = sum_memory if sum_memory else "Task just started. No agents have worked yet."
-            
-            # Include pre_mem (last step's memory summary) for better context
-            last_step_info = ""
-            if pre_agent and pre_mem:
-                last_step_info = f"\nLAST STEP OUTPUT ({pre_agent}): {pre_mem[:300]}"
-            
-            user_prompt = f"""QUESTION: {question}
-
-PREVIOUS AGENT: {pre_agent if pre_agent else 'None (first step)'}{last_step_info}
-
-CURRENT PROGRESS:
-{progress_text}
-
-Which agent should work next? Reply with one word only."""
+            system_prompt, user_prompt = build_scheduler_prompt(
+                question=question,
+                agent_specs_prompt=self.registry.to_prompt(),
+                sum_memory=sum_memory,
+                pre_agent=pre_agent,
+                pre_mem=pre_mem,
+            )
 
             response = self._llm.chat(system_prompt, user_prompt, temperature=0.0)
             raw_response = response.strip()
